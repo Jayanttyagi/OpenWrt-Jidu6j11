@@ -1,0 +1,515 @@
+name: Build Out-of-the-Box OpenWrt for JIDU 6411
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_repo:
+        description: "OpenWrt Git repository containing JIDU6J11 support"
+        required: true
+        default: "https://github.com/Sandiep/openwrt.git"
+
+      openwrt_ref:
+        description: "Branch, tag, or commit containing JIDU6J11 support"
+        required: true
+        default: "qualcommbe-ipq95xx"
+
+      update_core_cves:
+        description: "Apply selected upstream OpenWrt userland security updates"
+        required: true
+        default: false
+        type: boolean
+
+      enable_containers:
+        description: "Enable cgroups, namespaces and LXC support"
+        required: true
+        default: true
+        type: boolean
+
+      wifi_ssid_2g:
+        description: "2.4 GHz Wi-Fi SSID"
+        required: true
+        default: "JIDU6411-OpenWrt-2G"
+
+      wifi_ssid_5g:
+        description: "5 GHz Wi-Fi SSID"
+        required: true
+        default: "JIDU6411-OpenWrt-5G"
+
+      wifi_password:
+        description: "Wi-Fi WPA2/WPA3 password, minimum 8 characters"
+        required: true
+        default: "HomelabAX6000"
+
+      wifi_country:
+        description: "Wi-Fi regulatory country code"
+        required: true
+        default: "IN"
+
+      lan_ip:
+        description: "Default router LAN IP address"
+        required: true
+        default: "192.168.1.1"
+
+      root_password:
+        description: "Optional root/LuCI password; leave blank for passwordless first login"
+        required: false
+        default: ""
+
+      extra_packages:
+        description: "Extra OpenWrt packages to compile, space separated"
+        required: false
+        default: >-
+          luci-ssl luci-app-sqm kmod-usb3 kmod-usb-storage
+          kmod-usb-storage-uas kmod-fs-ext4 block-mount htop curl
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jidu6411-openwrt-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-firmware:
+    name: Build JIDU 6411 OpenWrt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    env:
+      OPENWRT_REPO: ${{ inputs.openwrt_repo }}
+      OPENWRT_REF: ${{ inputs.openwrt_ref }}
+      UPDATE_CORE_CVES: ${{ inputs.update_core_cves }}
+      ENABLE_CONTAINERS: ${{ inputs.enable_containers }}
+      WIFI_SSID_2G: ${{ inputs.wifi_ssid_2g }}
+      WIFI_SSID_5G: ${{ inputs.wifi_ssid_5g }}
+      WIFI_PASSWORD: ${{ inputs.wifi_password }}
+      WIFI_COUNTRY: ${{ inputs.wifi_country }}
+      LAN_IP: ${{ inputs.lan_ip }}
+      ROOT_PASSWORD: ${{ inputs.root_password }}
+      EXTRA_PACKAGES: ${{ inputs.extrapackages }}
+
+      DEVICE_ID: jiorouter_ax6000-jidu6j11
+      TARGET_SUBDIR: qualcommbe/ipq95xx
+      OUTPUT_DIR: openwrt/bin/targets/qualcommbe/ipq95xx
+
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+
+          if [ "${#WIFI_PASSWORD}" -lt 8 ]; then
+            echo "::error::Wi-Fi password must be at least 8 characters."
+            exit 1
+          fi
+
+          if [ -z "$OPENWRT_REPO" ] || [ -z "$OPENWRT_REF" ]; then
+            echo "::error::OpenWrt repository and ref are required."
+            exit 1
+          fi
+
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+        with:
+          path: workflow
+
+      - name: Install build prerequisites
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext libncurses-dev libssl-dev python3-setuptools \
+            python3-pyelftools swig unzip zlib1g-dev ccache \
+            git rsync curl wget jq file zstd xz-utils \
+            squashfs-tools u-boot-tools device-tree-compiler mtd-utils
+
+          sudo apt-get clean
+
+      - name: Free runner disk space
+        run: |
+          set -euo pipefail
+
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          df -h
+
+      - name: Clone selected OpenWrt source tree
+        run: |
+          set -euo pipefail
+
+          git clone "$OPENWRT_REPO" openwrt
+          cd openwrt
+
+          if git show-ref --verify --quiet "refs/remotes/origin/$OPENWRT_REF"; then
+            git checkout "$OPENWRT_REF"
+          elif git show-ref --verify --quiet "refs/tags/$OPENWRT_REF"; then
+            git checkout "$OPENWRT_REF"
+          else
+            git checkout "$OPENWRT_REF"
+          fi
+
+          build_commit="$(git rev-parse --short HEAD)"
+          echo "BUILD_COMMIT=$build_commit" >> "$GITHUB_ENV"
+
+          echo "Building OpenWrt revision: $build_commit"
+
+      - name: Verify JIDU6J11 device support
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+
+          if ! grep -Rqs "jiorouter_ax6000-jidu6j11" \
+            target/linux/qualcommbe; then
+            echo "::error::Selected OpenWrt tree does not contain device jiorouter_ax6000-jidu6j11."
+            echo "::error::Use a fork/branch that already provides JIDU6J11 support."
+            exit 1
+          fi
+
+          grep -Rni "jiorouter_ax6000-jidu6j11" target/linux/qualcommbe
+
+      - name: Install OpenWrt feeds
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Apply selected upstream userland security updates
+        if: env.UPDATE_CORE_CVES == 'true'
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/openwrt/openwrt.git || true
+          git fetch upstream main --depth=1
+
+          package_paths=(
+            package/network/services/dnsmasq
+            package/network/services/dropbear
+            package/network/services/hostapd
+            package/network/services/uhttpd
+            package/network/utils/curl
+            package/libs/openssl
+            package/libs/wolfssl
+            package/libs/mbedtls
+            package/utils/busybox
+          )
+
+          for path in "${package_paths[@]}"; do
+            if git cat-file -e "upstream/main:$path" 2>/dev/null; then
+              echo "Updating $path from upstream/main"
+              git checkout upstream/main -- "$path"
+            else
+              echo "Skipping unavailable upstream path: $path"
+            fi
+          done
+
+      - name: Inject out-of-the-box first-boot configuration
+        run: |
+          set -euo pipefail
+
+          mkdir -p openwrt/files/etc/uci-defaults
+
+          cat > openwrt/files/etc/uci-defaults/99-jidu6411-out-of-box <<'EOF'
+          #!/bin/sh
+          set -e
+
+          LAN_IP="${LAN_IP:-192.168.1.1}"
+          WIFI_COUNTRY="${WIFI_COUNTRY:-IN}"
+          WIFI_SSID_2G="${WIFI_SSID_2G:-JIDU6411-OpenWrt-2G}"
+          WIFI_SSID_5G="${WIFI_SSID_5G:-JIDU6411-OpenWrt-5G}"
+          WIFI_PASSWORD="${WIFI_PASSWORD:-}"
+
+          uci set network.lan.ipaddr="$LAN_IP"
+          uci commit network
+
+          for radio in radio0 radio1; do
+            if uci -q get "wireless.$radio" >/dev/null; then
+              uci set "wireless.$radio.disabled=0"
+              uci set "wireless.$radio.country=$WIFI_COUNTRY"
+
+              if [ "$radio" = "radio0" ]; then
+                uci set "wireless.$radio.htmode=HT20"
+                ssid="$WIFI_SSID_2G"
+              else
+                uci set "wireless.$radio.htmode=HE160"
+                ssid="$WIFI_SSID_5G"
+              fi
+
+              iface="default_${radio}"
+
+              if ! uci -q get "wireless.$iface" >/dev/null; then
+                iface="$(uci add wireless wifi-iface)"
+                uci set "wireless.$iface.device=$radio"
+                uci set "wireless.$iface.network=lan"
+                uci set "wireless.$iface.mode=ap"
+              fi
+
+              uci set "wireless.$iface.ssid=$ssid"
+              uci set "wireless.$iface.encryption=sae-mixed"
+              uci set "wireless.$iface.key=$WIFI_PASSWORD"
+            fi
+          done
+
+          uci commit wireless
+
+          uci set system.@system[0].hostname="JIDU6411-OpenWrt"
+          uci set system.@system[0].zonename="Asia/Kolkata"
+          uci set system.@system[0].timezone="IST-5:30"
+          uci commit system
+
+          if [ -n "$ROOT_PASSWORD" ]; then
+            printf '%s\n' "$ROOT_PASSWORD" "$ROOT_PASSWORD" | passwd root
+          fi
+
+          exit 0
+          EOF
+
+          sed -i 's/^          //' \
+            openwrt/files/etc/uci-defaults/99-jidu6411-out-of-box
+
+          chmod 755 openwrt/files/etc/uci-defaults/99-jidu6411-out-of-box
+
+      - name: Copy optional repository files overlay
+        run: |
+          set -euo pipefail
+
+          if [ -d workflow/files ]; then
+            mkdir -p openwrt/files
+            cp -a workflow/files/. openwrt/files/
+          fi
+
+      - name: Generate OpenWrt configuration
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+
+          cat > .config <<EOF
+          CONFIG_TARGET_qualcommbe=y
+          CONFIG_TARGET_qualcommbe_ipq95xx=y
+          CONFIG_TARGET_qualcommbe_ipq95xx_DEVICE_jiorouter_ax6000-jidu6j11=y
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
+          CONFIG_PACKAGE_luci=y
+          EOF
+
+          for package in $EXTRA_PACKAGES; do
+            echo "CONFIG_PACKAGE_${package}=y" >> .config
+          done
+
+          if [ "$ENABLE_CONTAINERS" = "true" ]; then
+            cat >> .config <<EOF
+          CONFIG_KERNEL_CGROUPS=y
+          CONFIG_KERNEL_CGROUP_DEVICE=y
+          CONFIG_KERNEL_CGROUP_FREEZER=y
+          CONFIG_KERNEL_CGROUP_PIDS=y
+          CONFIG_KERNEL_CGROUP_SCHED=y
+          CONFIG_KERNEL_CPUSETS=y
+          CONFIG_KERNEL_MEMCG=y
+          CONFIG_KERNEL_NAMESPACES=y
+          CONFIG_KERNEL_UTS_NS=y
+          CONFIG_KERNEL_IPC_NS=y
+          CONFIG_KERNEL_USER_NS=y
+          CONFIG_KERNEL_PID_NS=y
+          CONFIG_KERNEL_NET_NS=y
+          CONFIG_KERNEL_SECCOMP=y
+          CONFIG_KERNEL_POSIX_MQUEUE=y
+          CONFIG_KERNEL_FHANDLE=y
+          CONFIG_PACKAGE_lxc=y
+          EOF
+          fi
+
+          sed -i 's/^          //' .config
+
+          make defconfig
+
+          if ! grep -q \
+            "CONFIG_TARGET_qualcommbe_ipq95xx_DEVICE_jiorouter_ax6000-jidu6j11=y" \
+            .config; then
+            echo "::error::JIDU6J11 device was not selected by make defconfig."
+            grep "CONFIG_TARGET_qualcommbe_ipq95xx_DEVICE" .config || true
+            exit 1
+          fi
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: openwrt/.ccache
+          key: jidu6411-ccache-${{ env.BUILD_COMMIT }}-${{ hashFiles('openwrt/.config') }}
+          restore-keys: |
+            jidu6411-ccache-${{ env.BUILD_COMMIT }}-
+            jidu6411-ccache-
+
+      - name: Download source archives
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+
+          export CCACHE_DIR="$GITHUB_WORKSPACE/openwrt/.ccache"
+          export CCACHE_MAXSIZE="5G"
+
+          make download -j"$(nproc)"
+
+      - name: Compile OpenWrt firmware
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+
+          export CCACHE_DIR="$GITHUB_WORKSPACE/openwrt/.ccache"
+          export CCACHE_MAXSIZE="5G"
+
+          make -j"$(nproc)" V=s
+
+      - name: Create installable initramfs factory UBI
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+
+          device="$DEVICE_ID"
+
+          itb="$(find "$OUTPUT_DIR" -maxdepth 1 -type f \
+            -name "*${device}-initramfs-uImage.itb" | head -n1)"
+
+          if [ -z "$itb" ]; then
+            echo "::error::Initramfs ITB not found for ${device}."
+            find "$OUTPUT_DIR" -maxdepth 1 -type f -print || true
+            exit 1
+          fi
+
+          cat > ubinize.cfg <<EOF
+          [kernel]
+          mode=ubi
+          image=$(basename "$itb")
+          vol_id=0
+          vol_name=kernel
+          vol_type=dynamic
+          vol_alignment=1
+          vol_flags=autoresize
+          EOF
+
+          sed -i 's/^          //' ubinize.cfg
+
+          ubinize \
+            -o "${OUTPUT_DIR}/${device}-initramfs-factory.ubi" \
+            -m 2048 \
+            -p 128KiB \
+            -s 2048 \
+            ubinize.cfg
+
+      - name: Collect build outputs
+        if: always()
+        run: |
+          set -euo pipefail
+
+          mkdir -p output
+
+          device="$DEVICE_ID"
+
+          # Permanent firmware for second-stage installation
+          find "$OUTPUT_DIR" -maxdepth 1 -type f \
+            -name "*${device}-squashfs-sysupgrade.bin" \
+            -exec cp -v {} output/ \;
+
+          # Initramfs FIT image used to construct the factory UBI
+          find "$OUTPUT_DIR" -maxdepth 1 -type f \
+            -name "*${device}-initramfs-uImage.itb" \
+            -exec cp -v {} output/ \;
+
+          # Factory UBI for initial SSH-based installation
+          find "$OUTPUT_DIR" -maxdepth 1 -type f \
+            -name "*${device}-initramfs-factory.ubi" \
+            -exec cp -v {} output/ \;
+
+          # Package manifest, if produced
+          find "$OUTPUT_DIR" -maxdepth 1 -type f \
+            -name "*.manifest" \
+            -exec cp -v {} output/ \; || true
+
+          # First-boot customization script for auditability
+          if [ -f openwrt/files/etc/uci-defaults/99-jidu6411-out-of-box ]; then
+            cp -v openwrt/files/etc/uci-defaults/99-jidu6411-out-of-box \
+              output/99-jidu6411-out-of-box
+          fi
+
+          cd output
+
+          find . -maxdepth 1 -type f ! -name sha256sums.txt \
+            -exec sha256sum {} + > sha256sums.txt
+
+          echo "Collected outputs:"
+          ls -lah
+
+      - name: Verify required firmware artifacts
+        if: success()
+        run: |
+          set -euo pipefail
+
+          device="$DEVICE_ID"
+
+          factory="$(find output -maxdepth 1 -type f \
+            -name "*${device}-initramfs-factory.ubi" | head -n1)"
+
+          sysupgrade="$(find output -maxdepth 1 -type f \
+            -name "*${device}-squashfs-sysupgrade.bin" | head -n1)"
+
+          if [ -z "$factory" ]; then
+            echo "::error::Required factory UBI was not produced."
+            exit 1
+          fi
+
+          if [ -z "$sysupgrade" ]; then
+            echo "::error::Required sysupgrade image was not produced."
+            exit 1
+          fi
+
+          echo "Factory UBI: $factory"
+          echo "Sysupgrade image: $sysupgrade"
+
+      - name: Upload build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JIDU6411-OpenWrt-${{ env.BUILD_COMMIT }}-${{ github.run_number }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0-jidu6411-${{ env.BUILD_COMMIT }}-${{ github.run_number }}
+          name: JIDU 6411 OpenWrt ${{ env.BUILD_COMMIT }}
+          body: |
+            Out-of-the-Box OpenWrt build for Jio AirFiber JIDU 6411 / 6J11.
+
+            **Source revision:** `${{ env.BUILD_COMMIT }}`  
+            **Repository:** `${{ inputs.openwrt_repo }}`  
+            **Ref:** `${{ inputs.openwrt_ref }}`
+
+            **Included configuration**
+
+            - Default LAN IP: `${{ inputs.lan_ip }}`
+            - 2.4 GHz SSID: `${{ inputs.wifi_ssid_2g }}`
+            - 5 GHz SSID: `${{ inputs.wifi_ssid_5g }}`
+            - Wi-Fi country: `${{ inputs.wifi_country }}`
+            - Containers/LXC: `${{ inputs.enable_containers }}`
+            - Upstream userland security sync: `${{ inputs.update_core_cves }}`
+
+            **Installation notes**
+
+            - Use the `*-initramfs-factory.ubi` only for the initial SSH-based installation procedure.
+            - After OpenWrt is running, flash the `*-squashfs-sysupgrade.bin` as the permanent firmware.
+            - Do not flash the automatically generated `*-squashfs-factory.ubi` through the JIDU6J11 SSH flashing method.
+            - Verify `sha256sums.txt` before flashing.
+          files: |
+            output/*
