@@ -1,4 +1,4 @@
-name: Build Out-of-the-Box OpenWrt for JIDU 6411
+name: Build Out-of-the-Box OpenWrt for Jio AX6000 JIDU6J11
 
 on:
   workflow_dispatch:
@@ -11,7 +11,19 @@ on:
       openwrt_ref:
         description: "Branch, tag, or commit containing JIDU6J11 support"
         required: true
-        default: "qualcommbe-ipq95xx"
+        default: "main"
+
+      jidu_variant:
+        description: "JIDU6J11 hardware variant"
+        required: true
+        default: "6411"
+        type: choice
+        options:
+          - "6111"
+          - "6411"
+          - "6611"
+          - "6811"
+          - "6911"
 
       update_core_cves:
         description: "Apply selected upstream OpenWrt userland security updates"
@@ -22,7 +34,7 @@ on:
       enable_containers:
         description: "Enable cgroups, namespaces and LXC support"
         required: true
-        default: true
+        default: false
         type: boolean
 
       wifi_ssid_2g:
@@ -66,18 +78,19 @@ permissions:
   contents: write
 
 concurrency:
-  group: jidu6411-openwrt-${{ github.ref }}
+  group: jidu6j11-openwrt-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-firmware:
-    name: Build JIDU 6411 OpenWrt
+    name: Build Jio AX6000 JIDU6J11 OpenWrt
     runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     env:
       OPENWRT_REPO: ${{ inputs.openwrt_repo }}
       OPENWRT_REF: ${{ inputs.openwrt_ref }}
+      JIDU_VARIANT: ${{ inputs.jidu_variant }}
       UPDATE_CORE_CVES: ${{ inputs.update_core_cves }}
       ENABLE_CONTAINERS: ${{ inputs.enable_containers }}
       WIFI_SSID_2G: ${{ inputs.wifi_ssid_2g }}
@@ -88,8 +101,7 @@ jobs:
       ROOT_PASSWORD: ${{ inputs.root_password }}
       EXTRA_PACKAGES: ${{ inputs.extrapackages }}
 
-      DEVICE_ID: jiorouter_ax6000-jidu6j11
-      TARGET_SUBDIR: qualcommbe/ipq95xx
+      DEVICE_ID: jiorouter_ax6000-jidu6j11-${{ inputs.jidu_variant }}
       OUTPUT_DIR: openwrt/bin/targets/qualcommbe/ipq95xx
 
     steps:
@@ -106,6 +118,16 @@ jobs:
             echo "::error::OpenWrt repository and ref are required."
             exit 1
           fi
+
+          case "$JIDU_VARIANT" in
+            6111|6411|6611|6811|6911) ;;
+            *)
+              echo "::error::Unsupported JIDU variant: $JIDU_VARIANT"
+              exit 1
+              ;;
+          esac
+
+          echo "Building device: $DEVICE_ID"
 
       - name: Checkout workflow repository
         uses: actions/checkout@v4
@@ -153,7 +175,14 @@ jobs:
           elif git show-ref --verify --quiet "refs/tags/$OPENWRT_REF"; then
             git checkout "$OPENWRT_REF"
           else
-            git checkout "$OPENWRT_REF"
+            echo "::error::Ref '$OPENWRT_REF' does not exist in $OPENWRT_REPO."
+            echo "::group::Available remote branches"
+            git ls-remote --heads origin
+            echo "::endgroup::"
+            echo "::group::Available remote tags"
+            git ls-remote --tags origin
+            echo "::endgroup::"
+            exit 1
           fi
 
           build_commit="$(git rev-parse --short HEAD)"
@@ -161,19 +190,21 @@ jobs:
 
           echo "Building OpenWrt revision: $build_commit"
 
-      - name: Verify JIDU6J11 device support
+      - name: Verify selected JIDU6J11 device support
         working-directory: openwrt
         run: |
           set -euo pipefail
 
-          if ! grep -Rqs "jiorouter_ax6000-jidu6j11" \
-            target/linux/qualcommbe; then
-            echo "::error::Selected OpenWrt tree does not contain device jiorouter_ax6000-jidu6j11."
-            echo "::error::Use a fork/branch that already provides JIDU6J11 support."
+          if ! grep -Rqs "$DEVICE_ID" target/linux/qualcommbe; then
+            echo "::error::Selected OpenWrt tree does not contain device $DEVICE_ID."
+            echo "::group::Available JIDU6J11 devices"
+            grep -RhoE 'jiorouter_ax6000-jidu6j11-[0-9]+' target/linux/qualcommbe \
+              | sort -u || true
+            echo "::endgroup::"
             exit 1
           fi
 
-          grep -Rni "jiorouter_ax6000-jidu6j11" target/linux/qualcommbe
+          grep -Rni "$DEVICE_ID" target/linux/qualcommbe
 
       - name: Install OpenWrt feeds
         working-directory: openwrt
@@ -219,7 +250,7 @@ jobs:
 
           mkdir -p openwrt/files/etc/uci-defaults
 
-          cat > openwrt/files/etc/uci-defaults/99-jidu6411-out-of-box <<'EOF'
+          cat > openwrt/files/etc/uci-defaults/99-jidu6j11-out-of-box <<'EOF'
           #!/bin/sh
           set -e
 
@@ -262,7 +293,7 @@ jobs:
 
           uci commit wireless
 
-          uci set system.@system[0].hostname="JIDU6411-OpenWrt"
+          uci set system.@system[0].hostname="JIDU6J11-OpenWrt"
           uci set system.@system[0].zonename="Asia/Kolkata"
           uci set system.@system[0].timezone="IST-5:30"
           uci commit system
@@ -275,9 +306,9 @@ jobs:
           EOF
 
           sed -i 's/^          //' \
-            openwrt/files/etc/uci-defaults/99-jidu6411-out-of-box
+            openwrt/files/etc/uci-defaults/99-jidu6j11-out-of-box
 
-          chmod 755 openwrt/files/etc/uci-defaults/99-jidu6411-out-of-box
+          chmod 755 openwrt/files/etc/uci-defaults/99-jidu6j11-out-of-box
 
       - name: Copy optional repository files overlay
         run: |
@@ -296,7 +327,7 @@ jobs:
           cat > .config <<EOF
           CONFIG_TARGET_qualcommbe=y
           CONFIG_TARGET_qualcommbe_ipq95xx=y
-          CONFIG_TARGET_qualcommbe_ipq95xx_DEVICE_jiorouter_ax6000-jidu6j11=y
+          CONFIG_TARGET_qualcommbe_ipq95xx_DEVICE_${DEVICE_ID}=y
           CONFIG_DEVEL=y
           CONFIG_CCACHE=y
           CONFIG_PACKAGE_luci=y
@@ -333,9 +364,9 @@ jobs:
           make defconfig
 
           if ! grep -q \
-            "CONFIG_TARGET_qualcommbe_ipq95xx_DEVICE_jiorouter_ax6000-jidu6j11=y" \
+            "CONFIG_TARGET_qualcommbe_ipq95xx_DEVICE_${DEVICE_ID}=y" \
             .config; then
-            echo "::error::JIDU6J11 device was not selected by make defconfig."
+            echo "::error::Device $DEVICE_ID was not selected by make defconfig."
             grep "CONFIG_TARGET_qualcommbe_ipq95xx_DEVICE" .config || true
             exit 1
           fi
@@ -344,10 +375,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: openwrt/.ccache
-          key: jidu6411-ccache-${{ env.BUILD_COMMIT }}-${{ hashFiles('openwrt/.config') }}
+          key: jidu6j11-ccache-${{ env.DEVICE_ID }}-${{ env.BUILD_COMMIT }}-${{ hashFiles('openwrt/.config') }}
           restore-keys: |
-            jidu6411-ccache-${{ env.BUILD_COMMIT }}-
-            jidu6411-ccache-
+            jidu6j11-ccache-${{ env.DEVICE_ID }}-${{ env.BUILD_COMMIT }}-
+            jidu6j11-ccache-${{ env.DEVICE_ID }}-
 
       - name: Download source archives
         working-directory: openwrt
@@ -374,13 +405,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          device="$DEVICE_ID"
-
           itb="$(find "$OUTPUT_DIR" -maxdepth 1 -type f \
-            -name "*${device}-initramfs-uImage.itb" | head -n1)"
+            -name "*${DEVICE_ID}-initramfs-uImage.itb" | head -n1)"
 
           if [ -z "$itb" ]; then
-            echo "::error::Initramfs ITB not found for ${device}."
+            echo "::error::Initramfs ITB not found for ${DEVICE_ID}."
             find "$OUTPUT_DIR" -maxdepth 1 -type f -print || true
             exit 1
           fi
@@ -399,7 +428,7 @@ jobs:
           sed -i 's/^          //' ubinize.cfg
 
           ubinize \
-            -o "${OUTPUT_DIR}/${device}-initramfs-factory.ubi" \
+            -o "${OUTPUT_DIR}/${DEVICE_ID}-initramfs-factory.ubi" \
             -m 2048 \
             -p 128KiB \
             -s 2048 \
@@ -412,32 +441,25 @@ jobs:
 
           mkdir -p output
 
-          device="$DEVICE_ID"
-
-          # Permanent firmware for second-stage installation
           find "$OUTPUT_DIR" -maxdepth 1 -type f \
-            -name "*${device}-squashfs-sysupgrade.bin" \
+            -name "*${DEVICE_ID}-squashfs-sysupgrade.bin" \
             -exec cp -v {} output/ \;
 
-          # Initramfs FIT image used to construct the factory UBI
           find "$OUTPUT_DIR" -maxdepth 1 -type f \
-            -name "*${device}-initramfs-uImage.itb" \
+            -name "*${DEVICE_ID}-initramfs-uImage.itb" \
             -exec cp -v {} output/ \;
 
-          # Factory UBI for initial SSH-based installation
           find "$OUTPUT_DIR" -maxdepth 1 -type f \
-            -name "*${device}-initramfs-factory.ubi" \
+            -name "*${DEVICE_ID}-initramfs-factory.ubi" \
             -exec cp -v {} output/ \;
 
-          # Package manifest, if produced
           find "$OUTPUT_DIR" -maxdepth 1 -type f \
             -name "*.manifest" \
             -exec cp -v {} output/ \; || true
 
-          # First-boot customization script for auditability
-          if [ -f openwrt/files/etc/uci-defaults/99-jidu6411-out-of-box ]; then
-            cp -v openwrt/files/etc/uci-defaults/99-jidu6411-out-of-box \
-              output/99-jidu6411-out-of-box
+          if [ -f openwrt/files/etc/uci-defaults/99-jidu6j11-out-of-box ]; then
+            cp -v openwrt/files/etc/uci-defaults/99-jidu6j11-out-of-box \
+              output/99-jidu6j11-out-of-box
           fi
 
           cd output
@@ -453,13 +475,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          device="$DEVICE_ID"
-
           factory="$(find output -maxdepth 1 -type f \
-            -name "*${device}-initramfs-factory.ubi" | head -n1)"
+            -name "*${DEVICE_ID}-initramfs-factory.ubi" | head -n1)"
 
           sysupgrade="$(find output -maxdepth 1 -type f \
-            -name "*${device}-squashfs-sysupgrade.bin" | head -n1)"
+            -name "*${DEVICE_ID}-squashfs-sysupgrade.bin" | head -n1)"
 
           if [ -z "$factory" ]; then
             echo "::error::Required factory UBI was not produced."
@@ -478,20 +498,21 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: JIDU6411-OpenWrt-${{ env.BUILD_COMMIT }}-${{ github.run_number }}
+          name: JIDU6J11-${{ inputs.jidu_variant }}-OpenWrt-${{ env.BUILD_COMMIT }}-${{ github.run_number }}
           path: output/
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
 
       - name: Publish GitHub release
         if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0-jidu6411-${{ env.BUILD_COMMIT }}-${{ github.run_number }}
-          name: JIDU 6411 OpenWrt ${{ env.BUILD_COMMIT }}
+          tag_name: v1.0-jidu6j11-${{ inputs.jidu_variant }}-${{ env.BUILD_COMMIT }}-${{ github.run_number }}
+          name: Jio AX6000 JIDU6J11-${{ inputs.jidu_variant }} OpenWrt ${{ env.BUILD_COMMIT }}
           body: |
-            Out-of-the-Box OpenWrt build for Jio AirFiber JIDU 6411 / 6J11.
+            Out-of-the-Box OpenWrt build for Jio AX6000 JIDU6J11-${{ inputs.jidu_variant }}.
 
+            **Device:** `${{ env.DEVICE_ID }}`  
             **Source revision:** `${{ env.BUILD_COMMIT }}`  
             **Repository:** `${{ inputs.openwrt_repo }}`  
             **Ref:** `${{ inputs.openwrt_ref }}`
@@ -507,8 +528,8 @@ jobs:
 
             **Installation notes**
 
-            - Use the `*-initramfs-factory.ubi` only for the initial SSH-based installation procedure.
-            - After OpenWrt is running, flash the `*-squashfs-sysupgrade.bin` as the permanent firmware.
+            - Use `*-initramfs-factory.ubi` only for the initial SSH-based installation procedure.
+            - After OpenWrt boots, flash `*-squashfs-sysupgrade.bin` as the permanent firmware.
             - Do not flash the automatically generated `*-squashfs-factory.ubi` through the JIDU6J11 SSH flashing method.
             - Verify `sha256sums.txt` before flashing.
           files: |
